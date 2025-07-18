@@ -2,9 +2,9 @@
 
 With the news of Wells Fargo splitting up with Bilt, I built this free, offline tool to convert their PDF Bank Statements to CSV.
 
-Wells Fargo does not allow users to export by `.csv` past 120 days for credit cards. Compared to most large retail banks, this makes even a year's worth of transactions pretty unmanageable to do by hand.
+Wells Fargo does not allow users to export by `.csv` past 120 days for credit cards. Compared to most large retail banks, this is pretty low. Without a `.csv`, it makes even a year's worth of transactions pretty unmanageable to do by hand for taxes or accounting.
 
-A `.csv` format is useful for taxes, budgeting, and accounting.
+Use at your own discretion. This is not intended for other Wells Fargo Credit Card Statements or any future versions of the Bilt Card Statements when they switch to a new bank. There are some hard coded elements like 2024 as this was a quick and dirty util for me. I hope you find this helpful.
 
 ## Acknowledgements
 - Thanks to [Julian Kingman](https://github.com/JulianKingman/wells-fargo-statement-to-csv) for the original work getting a PDF parser to work.
