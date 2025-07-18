@@ -1,147 +1,193 @@
 import argparse
-import os
 import pdfplumber
-import sys
-import re
 import csv
-from dateutil.relativedelta import relativedelta
+import re
 from datetime import datetime
 
-def extract_transactions_for_page(page, columns, statement_date):
-    transactions = []
-    column_positions = {column: None for column in columns}
-            
-    words = page.extract_words(keep_blank_chars=True)
-    words.sort(key=lambda word: (word['top'], word['x0']))
-
-    if None in column_positions.values():
-      processed_indices = []
-      for i, word in enumerate(words):
-        if word['text'] in columns and column_positions[word['text']] is None:
-          column_positions[word['text']] = word['x0']
-          processed_indices.append(i)
-
-      # Remove processed words
-      for index in sorted(processed_indices, reverse=True):
-        del words[index]
+def extract_transactions_from_bilt_statement(file_path, output_path=None):
+    """Extract transactions from Wells Fargo Bilt PDF statement and save to CSV"""
     
-    # Group words by row
-    rows = []
-    for word in words:
-      row = word['top']
-      if not rows or rows[-1][0] != row:
-        rows.append((row, []))
-      rows[-1][1].append(word)
-
-    # Sort words in each row by x0 attribute
-    for _, words_in_row in rows:
-      words_in_row.sort(key=lambda word: word['x0'])
-
-    # Now you can process each row
-    for i, (row, words_in_row) in enumerate(rows):
-      # Initialize a new transaction
-      transaction = {column: '' for column in columns}
-
-      for word in words_in_row:
-        if 'Ending balance' in word['text']:
-          break
-        for column in columns:
-          try:
-            if column_positions[column] <= word['x0'] < column_positions.get(next(iter(columns[columns.index(column)+1:]), ''), float('inf')):
-              if column == "Date" and re.match(r'\d{1,2}/\d{1,2}', word['text']):
-                transaction["Date"] = word['text']
-              elif column != "Date":
-                transaction[column] += word['text'] + ' '
-          except:
-            print(f'Error processing word: {word}')
-            print(f'Columns: {columns}')
-            print(f'Column positions: {column_positions}')
-            print(f'Word: {word}')
-            sys.exit(1)
-      # Check if the line starts with a date
-      if re.match(r'\d{1,2}/\d{1,2}', transaction['Date']):
-        transactions.append(transaction)
-      elif i > 0 and re.match(r'\d{1,2}/\d{1,2}', rows[i-1][1][0]['text']):
-        # If the previous row starts with a date, append to the previous transaction
-        for column in columns:
-          if column != "Date":
-            transactions[-1][column] += '\n' + transaction[column]
-
-    # When processing the date, add the year and handle the new year transition
-    for transaction in transactions:
-        month, day = map(int, transaction['Date'].split('/'))
-        transaction_date = datetime(statement_date.year, month, day)
-        month_difference = relativedelta(transaction_date, statement_date).months
-
-        if month_difference > 10:
-            transaction_date = transaction_date.replace(year=statement_date.year - 1)
-        elif month_difference < -10:
-            transaction_date = transaction_date.replace(year=statement_date.year + 1)
-
-        transaction['Date'] = transaction_date.strftime('%m/%d/%Y')
-
-
-    return transactions
-
-def extract_transactions_across_pages(file_path, end_pattern, columns):
     transactions = []
-    is_extracting = False
-
-    # Extract the date from the filename
-    match = re.search(r'(\d{6})', file_path)
-    if match:
-        date_str = match.group(1)
-        statement_date = datetime.strptime(date_str, '%m%d%y')
-    else:
-        print(f'Could not extract date from filename: {file_path}')
-        return
-
+    
     with pdfplumber.open(file_path) as pdf:
-      for page in pdf.pages:
-        page_text = page.extract_text()
-        if page.page_number == 2:
-          is_extracting = True
-        if is_extracting:
-          transactions.extend(extract_transactions_for_page(page, columns, statement_date))
-        if end_pattern in page_text and is_extracting:
-          is_extracting = False
-          break
+        for page_num, page in enumerate(pdf.pages, 1):
+            page_text = page.extract_text()
+            if not page_text:
+                continue
+                
+            lines = page_text.split('\n')
+            
+            # Look for transaction header to identify transaction section
+            transaction_section = False
+            header_found = False
+            
+            for i, line in enumerate(lines):
+                line = line.strip()
+                
+                # Identify transaction header
+                if "Trans Date" in line and "Post Date" in line and "Amount" in line:
+                    transaction_section = True
+                    header_found = True
+                    print(f"Found transaction header on page {page_num}, line {i+1}")
+                    continue
+                
+                # Stop at section breaks
+                if transaction_section and any(section in line for section in [
+                    "Cash Advances", "Fees Charged", "Interest Charged", 
+                    "2024 Totals", "BiltProtect Summary", "Continued on next page"
+                ]):
+                    if "Continued on next page" not in line:
+                        transaction_section = False
+                    continue
+                
+                # Extract transaction data
+                if transaction_section and line:
+                    # Look for lines that start with MM/DD pattern
+                    if re.match(r'^\d{2}/\d{2}', line):
+                        transaction = parse_transaction_line(line, lines, i)
+                        if transaction:
+                            transactions.append(transaction)
+                            print(f"Extracted: {transaction}")
+    
+    # Save to CSV
+    if not output_path:
+        output_path = file_path.replace('.pdf', '_transactions.csv')
+    
+    save_transactions_to_csv(transactions, output_path)
+    print(f"\nExtracted {len(transactions)} transactions to {output_path}")
+    
     return transactions
 
-def convert_pdf(file_path):
-  columns = ["Date", "Number", "Description", "Deposits/", "Withdrawals/", "Ending daily"]
-  end_pattern = "The Ending Daily Balance does not reflect any pending withdrawals "
-  
-  transactions = extract_transactions_across_pages(file_path, end_pattern, columns)
+def parse_transaction_line(line, all_lines, line_index):
+    """Parse a single transaction line, handling multi-line transactions"""
+    
+    # Pattern to match the transaction format
+    # 07/26 07/26 230001700 5270487K10PYZ1F85 CHICK-FIL-A WASHINGTON DC $13.74
+    pattern = r'^(\d{2}/\d{2})\s+(\d{2}/\d{2})\s+(\w+)\s+(\w+)\s+(.+?)\s+(\$[\d,]+\.?\d*-?)$'
+    
+    match = re.match(pattern, line)
+    if not match:
+        return None
+    
+    trans_date = match.group(1)
+    post_date = match.group(2)
+    ref_number = match.group(3)
+    transaction_id = match.group(4)
+    description_and_amount = match.group(5) + " " + match.group(6)
+    
+    # Extract amount (last dollar amount in the line)
+    amount_matches = re.findall(r'\$[\d,]+\.?\d*-?', description_and_amount)
+    if not amount_matches:
+        return None
+    
+    amount = amount_matches[-1]
+    
+    # Description is everything except the last amount
+    description = description_and_amount.replace(amount, '').strip()
+    
+    # Handle multi-line transactions (like Amtrak)
+    # Check if next lines don't start with date pattern and might be continuation
+    next_line_index = line_index + 1
+    while (next_line_index < len(all_lines) and 
+           all_lines[next_line_index].strip() and
+           not re.match(r'^\d{2}/\d{2}', all_lines[next_line_index]) and
+           not any(section in all_lines[next_line_index] for section in [
+               "Cash Advances", "Fees Charged", "Interest Charged", 
+               "2024 Totals", "BiltProtect Summary", "Continued on next page"
+           ])):
+        continuation = all_lines[next_line_index].strip()
+        # Only add if it doesn't look like a new transaction or section
+        if continuation and not re.match(r'^\d{2}/\d{2}', continuation):
+            description += " " + continuation
+        next_line_index += 1
+    
+    # Clean up amount - remove $ and handle negatives
+    amount_clean = amount.replace('$', '').replace(',', '')
+    if amount_clean.endswith('-'):
+        amount_clean = '-' + amount_clean[:-1]
+    
+    try:
+        amount_float = float(amount_clean)
+    except ValueError:
+        print(f"Warning: Could not parse amount '{amount}' in line: {line}")
+        return None
+    
+    # Add year to dates (assume current year or statement year)
+    # You might want to extract the year from the statement date
+    current_year = datetime.now().year
+    trans_date_full = f"{trans_date}/{current_year}"
+    post_date_full = f"{post_date}/{current_year}"
+    
+    return {
+        'trans_date': trans_date_full,
+        'post_date': post_date_full,
+        'reference_number': ref_number,
+        'transaction_id': transaction_id,
+        'description': description.strip(),
+        'amount': amount_float
+    }
 
-  # Export to CSV
-  csv_file = file_path.replace('.pdf', '_transactions.csv')
-  with open(csv_file, 'w', newline='') as csvfile:
-      writer = csv.DictWriter(csvfile, fieldnames=columns)
-      writer.writeheader()
-      for transaction in transactions:
-          writer.writerow({column: transaction[column].strip() for column in columns})
+def save_transactions_to_csv(transactions, output_path):
+    """Save transactions to CSV file"""
+    
+    if not transactions:
+        print("No transactions to save")
+        return
+    
+    fieldnames = ['trans_date', 'post_date', 'reference_number', 'transaction_id', 'description', 'amount']
+    
+    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(transactions)
 
-  print(f"CSV file created: {csv_file}")
-
-def batch_convert(directory):
-  for root, dirs, files in os.walk(directory):
-      for file in files:
-          if file.endswith(".pdf"):
-              convert_pdf(os.path.join(root, file))
+def analyze_extracted_transactions(transactions):
+    """Analyze the extracted transactions for validation"""
+    
+    print("\n" + "="*60)
+    print("TRANSACTION ANALYSIS")
+    print("="*60)
+    
+    if not transactions:
+        print("No transactions found")
+        return
+    
+    print(f"Total transactions: {len(transactions)}")
+    
+    # Calculate totals
+    total_amount = sum(t['amount'] for t in transactions)
+    positive_total = sum(t['amount'] for t in transactions if t['amount'] > 0)
+    negative_total = sum(t['amount'] for t in transactions if t['amount'] < 0)
+    
+    print(f"Total amount: ${total_amount:.2f}")
+    print(f"Total debits: ${positive_total:.2f}")
+    print(f"Total credits: ${negative_total:.2f}")
+    
+    # Date range
+    dates = [t['trans_date'] for t in transactions]
+    print(f"Date range: {min(dates)} to {max(dates)}")
+    
+    # Sample transactions
+    print("\nSample transactions:")
+    for i, transaction in enumerate(transactions[:5]):
+        print(f"  {i+1}. {transaction['trans_date']} - {transaction['description'][:50]}... - ${transaction['amount']:.2f}")
+    
+    print("\n" + "="*60)
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", help="Convert all PDFs in the specified directory", action="store_true")
-    parser.add_argument("path", help="The path to the PDF file or directory to convert")
+    parser = argparse.ArgumentParser(description="Extract transactions from Wells Fargo Bilt PDF statement")
+    parser.add_argument("pdf_path", help="Path to the PDF file")
+    parser.add_argument("-o", "--output", help="Output CSV file path")
+    parser.add_argument("--analyze", action="store_true", help="Show transaction analysis")
+    
     args = parser.parse_args()
-
-    if args.batch:
-        batch_convert(args.path)
-    else:
-        convert_pdf(args.path)
     
+    # Extract transactions
+    transactions = extract_transactions_from_bilt_statement(args.pdf_path, args.output)
     
+    # Analyze if requested
+    if args.analyze:
+        analyze_extracted_transactions(transactions)
 
 if __name__ == "__main__":
     main()
